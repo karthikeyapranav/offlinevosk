@@ -9,75 +9,33 @@ import org.vosk.Recognizer
 import java.io.*
 import java.util.concurrent.Executors
 import kotlin.math.*
-import kotlin.random.Random
 
 class VoskModule(private val reactContext: ReactApplicationContext) :
     ReactContextBaseJavaModule(reactContext) {
 
     private var model: Model? = null
     private var recorder: AudioRecord? = null
-    private var isRecording = false
+    @Volatile private var isRecording = false
     private val executor = Executors.newSingleThreadExecutor()
 
-    private val SAMPLE_RATE   = 16000
-    private val CHANNELS      = AudioFormat.CHANNEL_IN_MONO
-    private val ENCODING      = AudioFormat.ENCODING_PCM_16BIT
-    private val FRAME_SAMPLES = 320  // 20ms at 16kHz
+    private val SAMPLE_RATE = 16000
+    private val CHANNELS    = AudioFormat.CHANNEL_IN_MONO
+    private val ENCODING    = AudioFormat.ENCODING_PCM_16BIT
 
-    // ── Calibrated for YOUR mic (from diagnostic report) ──────────
-    //
-    //  Your numbers:  P10=54  P50=574  P90=1450  Max=3541
-    //  Vosk sweet spot: 6000–10000 RMS
-    //
-    //  CRITICAL ORDERING INSIGHT:
-    //  All previous versions detected silence BEFORE amplifying.
-    //  So a speech frame at RMS=300 was thrown away as "silence"
-    //  before the gain of 4x ever ran. Fixed below: amplify FIRST.
-    //
-    //  New pipeline:
-    //    raw PCM
-    //      → 1. high-pass filter        (remove hum)
-    //      → 2. hard amplify ×GAIN      (bring everything up)
-    //      → 3. silence detection       (NOW on amplified signal)
-    //      → 4. per-frame normalize     (equalize soft words)
-    //      → 5. comfort noise injection (keep Vosk alive at pauses)
-    //      → 6. Vosk
-    // ──────────────────────────────────────────────────────────────
+    // Config from JS
+    private var cfgGlobalGain       = 1.5f
+    private var cfgNumPasses        = 3
 
-    // Step 2: Hard amplify — brings your P90 from 1450 → ~6000
-    // Formula: TARGET_RMS / your_P90 = 6000 / 1450 ≈ 4.1
-    // Set slightly higher (5.0) to cover soft speech below P90
-    private val HARD_GAIN = 5.0f
-
-    // Step 3: Silence threshold — evaluated AFTER hard amplify
-    // After 5x gain: your P10(54)→270, P50(574)→2870, P90(1450)→7250
-    // Set threshold between amplified noise floor and amplified speech
-    // 270 (noise floor after gain) vs 2870 (median speech after gain)
-    // Midpoint ≈ 1500 — captures even your soft speech
-    private val SILENCE_RMS_AFTER_GAIN = 1200f
-
-    // Step 4: Per-frame normalize target (after hard gain, speech is ~3000-7000)
-    // Push everything to 7000 to stress every syllable equally
-    private val FRAME_TARGET_RMS = 7000f
-    private val FRAME_MAX_GAIN   = 6f    // Cap: don't let noise frames explode (they're ~270 after gain)
-
-    // Step 5: Comfort noise — filled into silence so Vosk decoder never resets
-    // Must be BELOW SILENCE_RMS_AFTER_GAIN (1200) so Vosk ignores it
-    // But above ~100 so decoder sees continuous audio
-    private val COMFORT_NOISE_RMS  = 300f
-    // Only start injecting after 400ms of consecutive silence (20 frames × 20ms)
-    private val SILENCE_GAP_FRAMES = 20
-
-    // High-pass filter coefficient
-    private val HP_ALPHA = 0.97f
-
-    override fun getName(): String = "Vosk"
+    override fun getName() = "Vosk"
     @ReactMethod fun addListener(eventName: String) {}
     @ReactMethod fun removeListeners(count: Int) {}
 
-    // ══════════════════════════════════════════════════
-    //  MODEL
-    // ══════════════════════════════════════════════════
+    @ReactMethod
+    fun setConfig(cfg: ReadableMap, promise: Promise) {
+        if (cfg.hasKey("globalGain"))   cfgGlobalGain = cfg.getDouble("globalGain").toFloat()
+        if (cfg.hasKey("numPasses"))    cfgNumPasses  = cfg.getInt("numPasses")
+        promise.resolve("Config updated")
+    }
 
     @ReactMethod
     fun loadModel(promise: Promise) {
@@ -101,13 +59,9 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
         for (f in assets.list(path) ?: return) {
             val full = "$path/$f"; val out = File(dest, f)
             if (assets.list(full)?.isNotEmpty() == true) { out.mkdirs(); copyAssetFolder(full, out) }
-            else assets.open(full).use { i -> FileOutputStream(out).use { o -> i.copyTo(o) } }
+            else assets.open(full).use { inp -> FileOutputStream(out).use { o -> inp.copyTo(o) } }
         }
     }
-
-    // ══════════════════════════════════════════════════
-    //  RECORD → raw PCM file
-    // ══════════════════════════════════════════════════
 
     @ReactMethod
     fun startListening(promise: Promise) {
@@ -137,10 +91,6 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // ══════════════════════════════════════════════════
-    //  STOP → process → Vosk
-    // ══════════════════════════════════════════════════
-
     @ReactMethod
     fun stopListening(promise: Promise) {
         if (!isRecording) { promise.resolve("Not recording"); return }
@@ -153,44 +103,82 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
                 if (!raw.exists() || raw.length() == 0L) {
                     promise.resolve("No audio"); return@execute
                 }
-                sendEvent("onStatus", "Processing…")
+                sendEvent("onStatus", "Processing $cfgNumPasses passes...")
 
-                var s = readPcmFile(raw)
+                var bestTranscript = ""
+                var bestLength = 0
 
-                // ── CORRECT ORDER ──────────────────────────────────
-                // 1. High-pass filter (remove hum — operates on quiet signal,
-                //    does not depend on amplitude so order doesn't matter here)
-                s = highPassFilter(s)
+                for (pass in 1..cfgNumPasses) {
+                    // Vary gain from 0.7x to 1.3x base gain
+                    val gainFactor = 0.7f + (pass - 1) * 0.3f
+                    val passGain = cfgGlobalGain * gainFactor
+                    val transcript = processPcmFile(raw, passGain)
+                    sendEvent("onStatus", "Pass $pass (gain ${passGain}x): ${if (transcript.isEmpty()) "[no speech]" else transcript.take(60)}")
 
-                // 2. HARD AMPLIFY FIRST — bring quiet mic up to Vosk-friendly levels
-                //    Everything else runs on the amplified signal
-                s = hardAmplify(s, HARD_GAIN)
+                    if (transcript.length > bestLength) {
+                        bestLength = transcript.length
+                        bestTranscript = transcript
+                    }
+                }
 
-                // 3. Per-frame normalize — NOW on amplified signal
-                //    Each 20ms speech frame boosted to FRAME_TARGET_RMS
-                //    silence gate uses SILENCE_RMS_AFTER_GAIN (post-amplify values)
-                s = perFrameNormalize(s)
-
-                // 4. Bridge silences — inject comfort noise into pauses
-                //    so Vosk decoder context never resets mid-recording
-                s = bridgeSilences(s)
-
-                // 5. Vosk recognition on clean, loud, continuous audio
-                val transcript = runVosk(s)
-
-                if (transcript.isNotEmpty()) sendEvent("onFinalResult", transcript.trim())
+                if (bestTranscript.isNotEmpty()) {
+                    sendEvent("onFinalResult", bestTranscript)
+                } else {
+                    sendEvent("onStatus", "No speech detected in any pass")
+                }
                 raw.delete()
                 promise.resolve("Done")
             } catch (e: Exception) { promise.reject("PROCESS_ERROR", e.message) }
         }
     }
 
-    @ReactMethod fun clearText(promise: Promise) { promise.resolve("Cleared") }
+    private fun processPcmFile(file: File, gain: Float): String {
+        var samples = readPcmFile(file)
 
-    // ══════════════════════════════════════════════════
-    //  DIAGNOSE — records 5s and prints RMS stats
-    //  Run this whenever environment changes
-    // ══════════════════════════════════════════════════
+        // Apply gain (simple multiplication, but prevent clipping)
+        val gainLimited = gain.coerceIn(0.5f, 5f)  // max 5x to avoid distortion
+        samples = applyGain(samples, gainLimited)
+
+        // Run Vosk
+        return runVosk(samples)
+    }
+
+    private fun applyGain(input: ShortArray, gain: Float): ShortArray {
+        return ShortArray(input.size) { i ->
+            val v = (input[i] * gain).toInt().coerceIn(-32768, 32767)
+            v.toShort()
+        }
+    }
+
+    private fun runVosk(samples: ShortArray): String {
+        val rec = Recognizer(model, SAMPLE_RATE.toFloat())
+        val bytes = shortsToBytes(samples)
+        val chunkSize = 4096
+        var pos = 0
+        val transcript = StringBuilder()
+
+        while (pos + chunkSize <= bytes.size) {
+            val chunk = bytes.copyOfRange(pos, pos + chunkSize)
+            if (rec.acceptWaveForm(chunk, chunk.size)) {
+                val text = extractField(rec.result, "text")
+                if (text.isNotEmpty()) {
+                    if (transcript.isNotEmpty()) transcript.append(" ")
+                    transcript.append(text)
+                }
+            }
+            pos += chunkSize
+        }
+        if (pos < bytes.size) {
+            rec.acceptWaveForm(bytes.copyOfRange(pos, bytes.size), bytes.size - pos)
+        }
+        val finalText = extractField(rec.finalResult, "text")
+        if (finalText.isNotEmpty()) {
+            if (transcript.isNotEmpty()) transcript.append(" ")
+            transcript.append(finalText)
+        }
+        rec.close()
+        return transcript.toString()
+    }
 
     @ReactMethod
     fun diagnose(promise: Promise) {
@@ -206,9 +194,9 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
                 dr.startRecording()
 
                 val totalSamples = SAMPLE_RATE * 5
-                val all          = ShortArray(totalSamples)
-                var totalRead    = 0
-                val buf          = ByteArray(bufSize)
+                val all = ShortArray(totalSamples)
+                var totalRead = 0
+                val buf = ByteArray(bufSize)
 
                 while (totalRead < totalSamples) {
                     val n = dr.read(buf, 0, buf.size.coerceAtMost((totalSamples - totalRead) * 2))
@@ -224,63 +212,40 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
                 }
                 dr.stop(); dr.release()
 
+                val FRAME_SAMPLES = 320
                 val rmsList = mutableListOf<Float>()
                 var i = 0
                 while (i + FRAME_SAMPLES <= totalRead) {
-                    rmsList.add(rms(all, i, FRAME_SAMPLES)); i += FRAME_SAMPLES
+                    var sum = 0.0
+                    for (j in i until i + FRAME_SAMPLES) sum += all[j].toDouble().pow(2)
+                    rmsList.add(sqrt(sum / FRAME_SAMPLES).toFloat())
+                    i += FRAME_SAMPLES
                 }
                 if (rmsList.isEmpty()) { promise.reject("DIAG_ERROR", "No audio"); return@execute }
 
                 val sorted = rmsList.sorted()
-                val p10    = sorted[(sorted.size * 0.10).toInt()]
-                val p50    = sorted[(sorted.size * 0.50).toInt()]
-                val p90    = sorted[(sorted.size * 0.90).toInt()]
-                val avg    = sorted.average().toFloat()
-
-                // Compute what the values will look like AFTER hard gain
-                val gainedP10 = p10  * HARD_GAIN
-                val gainedP50 = p50  * HARD_GAIN
-                val gainedP90 = p90  * HARD_GAIN
+                val p10 = sorted[(sorted.size * 0.10).toInt()]
+                val p50 = sorted[(sorted.size * 0.50).toInt()]
+                val p90 = sorted[(sorted.size * 0.90).toInt()]
+                val avg = sorted.average().toFloat()
 
                 val report = buildString {
-                    appendLine("RAW (before processing)")
-                    appendLine("  Min  : ${sorted.first().toInt()}")
-                    appendLine("  Max  : ${sorted.last().toInt()}")
-                    appendLine("  Avg  : ${avg.toInt()}")
-                    appendLine("  P10  : ${p10.toInt()}  ← noise floor")
-                    appendLine("  P50  : ${p50.toInt()}  ← typical speech")
-                    appendLine("  P90  : ${p90.toInt()}  ← loud speech")
+                    appendLine("═══ DIAGNOSTIC REPORT ═══")
+                    appendLine("RAW audio RMS:")
+                    appendLine("  P10 : ${p10.toInt()}")
+                    appendLine("  P50 : ${p50.toInt()}")
+                    appendLine("  P90 : ${p90.toInt()}")
+                    appendLine("  Avg : ${avg.toInt()}")
                     appendLine()
-                    appendLine("AFTER ×${HARD_GAIN} gain")
-                    appendLine("  P10  : ${gainedP10.toInt()}")
-                    appendLine("  P50  : ${gainedP50.toInt()}")
-                    appendLine("  P90  : ${gainedP90.toInt()}")
-                    appendLine()
-                    appendLine("VOSK sweet spot: 6000–10000")
-                    appendLine("Your P90 after gain: ${gainedP90.toInt()}")
-                    val status = when {
-                        gainedP90 < 3000  -> "⚠ Too quiet — increase HARD_GAIN"
-                        gainedP90 < 6000  -> "⚠ Below sweet spot — increase HARD_GAIN slightly"
-                        gainedP90 < 12000 -> "✓ Good range"
-                        else              -> "⚠ May clip — reduce HARD_GAIN"
-                    }
-                    appendLine("Status: $status")
-                    appendLine()
-                    appendLine("Current SILENCE_RMS_AFTER_GAIN: ${SILENCE_RMS_AFTER_GAIN.toInt()}")
-                    appendLine("Your speech median after gain : ${gainedP50.toInt()}")
-                    val threshOk = SILENCE_RMS_AFTER_GAIN < gainedP50
-                    appendLine("Threshold OK? ${if (threshOk) "✓ Yes" else "✗ NO — threshold above speech!"}")
+                    appendLine("Suggested gain: ${(8000f / p90).coerceIn(1f, 10f)}")
                 }
-
                 sendEvent("onDiagnostic", report)
                 promise.resolve(report)
             } catch (e: Exception) { promise.reject("DIAG_ERROR", e.message) }
         }
     }
 
-    // ══════════════════════════════════════════════════
-    //  STEP 1 — Load PCM
-    // ══════════════════════════════════════════════════
+    @ReactMethod fun clearText(promise: Promise) { promise.resolve("Cleared") }
 
     private fun readPcmFile(file: File): ShortArray {
         val bytes = file.readBytes()
@@ -291,174 +256,27 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
         }
     }
 
-    // ══════════════════════════════════════════════════
-    //  STEP 2 — High-pass filter
-    // ══════════════════════════════════════════════════
-
-    private fun highPassFilter(input: ShortArray): ShortArray {
-        val out = ShortArray(input.size)
-        var pIn = 0f; var pOut = 0f
-        for (i in input.indices) {
-            val x = input[i].toFloat()
-            val y = HP_ALPHA * (pOut + x - pIn)
-            out[i] = y.coerceIn(-32768f, 32767f).toInt().toShort()
-            pIn = x; pOut = y
-        }
-        return out
-    }
-
-    // ══════════════════════════════════════════════════
-    //  STEP 3 — Hard amplify
-    //  Uniform gain across entire recording.
-    //  Brings quiet mic (P90=1450) into Vosk range (6000+)
-    //  MUST run before silence detection.
-    // ══════════════════════════════════════════════════
-
-    private fun hardAmplify(input: ShortArray, gain: Float): ShortArray =
-        ShortArray(input.size) { i ->
-            (input[i] * gain).coerceIn(-32768f, 32767f).toInt().toShort()
-        }
-
-    // ══════════════════════════════════════════════════
-    //  STEP 4 — Per-frame normalize
-    //  After hard amplify, speech frames are 2000–7000.
-    //  This pushes ALL speech frames to FRAME_TARGET_RMS
-    //  so every syllable — stressed or not — is equally
-    //  loud when Vosk sees it.
-    //
-    //  Silence gate is checked AFTER hard amplify:
-    //  SILENCE_RMS_AFTER_GAIN = 1200
-    //  → speech frames (2000+) get normalized
-    //  → noise frames (270) are left untouched (too low for FRAME_MAX_GAIN to blow up)
-    // ══════════════════════════════════════════════════
-
-    private fun perFrameNormalize(input: ShortArray): ShortArray {
-        val out = input.copyOf()
-        var i   = 0
-        while (i + FRAME_SAMPLES <= input.size) {
-            val frameRms = rms(input, i, FRAME_SAMPLES)
-            if (frameRms > SILENCE_RMS_AFTER_GAIN) {
-                val gain = (FRAME_TARGET_RMS / frameRms).coerceIn(1f, FRAME_MAX_GAIN)
-                for (k in i until i + FRAME_SAMPLES) {
-                    out[k] = (input[k] * gain).coerceIn(-32768f, 32767f).toInt().toShort()
-                }
-            }
-            i += FRAME_SAMPLES
-        }
-        return out
-    }
-
-    // ══════════════════════════════════════════════════
-    //  STEP 5 — Bridge silences with comfort noise
-    //
-    //  When Vosk gets a long run of near-zero samples it
-    //  internally flushes its decoder and resets context.
-    //  Words spoken after a pause lose all context from
-    //  before the pause → missed words.
-    //
-    //  Fix: replace silence with low-amplitude white noise.
-    //  RMS=300 is below SILENCE_RMS_AFTER_GAIN=1200 so
-    //  Vosk won't hallucinate words, but it's enough to
-    //  keep the decoder running continuously.
-    //
-    //  Only injected after SILENCE_GAP_FRAMES (400ms) of
-    //  consecutive silence — short natural gaps between
-    //  syllables are left untouched.
-    // ══════════════════════════════════════════════════
-
-    private fun bridgeSilences(input: ShortArray): ShortArray {
-        val out           = input.copyOf()
-        var silenceFrames = 0
-        var i             = 0
-        while (i + FRAME_SAMPLES <= input.size) {
-            val frameRms = rms(input, i, FRAME_SAMPLES)
-            if (frameRms < SILENCE_RMS_AFTER_GAIN) {
-                silenceFrames++
-                if (silenceFrames > SILENCE_GAP_FRAMES) {
-                    for (k in i until i + FRAME_SAMPLES) {
-                        out[k] = ((Random.nextFloat() * 2f - 1f) * COMFORT_NOISE_RMS)
-                            .coerceIn(-32768f, 32767f).toInt().toShort()
-                    }
-                }
-            } else {
-                silenceFrames = 0
-            }
-            i += FRAME_SAMPLES
-        }
-        return out
-    }
-
-    // ══════════════════════════════════════════════════
-    //  STEP 6 — Vosk recognition
-    //  Single Recognizer for the whole recording.
-    //  Comfort noise ensures context is never lost.
-    // ══════════════════════════════════════════════════
-
-    private fun runVosk(samples: ShortArray): String {
-        val rec        = Recognizer(model, SAMPLE_RATE.toFloat())
-        val transcript = StringBuilder()
-        val bytes      = shortsToBytes(samples)
-        val chunkSize  = 4096
-        var pos        = 0
-
-        while (pos + chunkSize <= bytes.size) {
-            val chunk = bytes.copyOfRange(pos, pos + chunkSize)
-            if (rec.acceptWaveForm(chunk, chunk.size)) {
-                val text = extractField(rec.result, "text")
-                if (text.isNotEmpty()) {
-                    if (transcript.isNotEmpty()) transcript.append(" ")
-                    transcript.append(text)
-                    sendEvent("onPartialResult", transcript.toString().trim())
-                }
-            } else {
-                val partial = extractField(rec.partialResult, "partial")
-                if (partial.isNotEmpty()) sendEvent("onPartialResult", partial)
-            }
-            pos += chunkSize
-        }
-        if (pos < bytes.size) {
-            val chunk = bytes.copyOfRange(pos, bytes.size)
-            rec.acceptWaveForm(chunk, chunk.size)
-        }
-        val finalText = extractField(rec.finalResult, "text")
-        if (finalText.isNotEmpty()) {
-            if (transcript.isNotEmpty()) transcript.append(" ")
-            transcript.append(finalText)
-        }
-        rec.close()
-        return transcript.toString()
-    }
-
-    // ══════════════════════════════════════════════════
-    //  UTILITIES
-    // ══════════════════════════════════════════════════
-
-    private fun rms(s: ShortArray, offset: Int, length: Int): Float {
-        var sum = 0.0
-        val end = (offset + length).coerceAtMost(s.size)
-        for (i in offset until end) sum += s[i].toDouble().pow(2)
-        return sqrt(sum / (end - offset)).toFloat()
-    }
-
     private fun shortsToBytes(shorts: ShortArray): ByteArray {
         val bytes = ByteArray(shorts.size * 2)
         for (i in shorts.indices) {
-            bytes[i * 2]     = (shorts[i].toInt() and 0xFF).toByte()
+            bytes[i * 2] = (shorts[i].toInt() and 0xFF).toByte()
             bytes[i * 2 + 1] = (shorts[i].toInt() shr 8 and 0xFF).toByte()
         }
         return bytes
     }
 
-    private fun extractField(json: String, field: String): String =
-        try { JSONObject(json).optString(field, "").trim() } catch (_: Exception) { "" }
+    private fun extractField(json: String, field: String): String {
+        return try {
+            JSONObject(json).optString(field, "").trim()
+        } catch (_: Exception) { "" }
+    }
 
     private fun rawPcmFile() = File(reactContext.cacheDir, "vosk_raw.pcm")
 
     private fun sendEvent(eventName: String, text: String) {
         val map = Arguments.createMap()
         map.putString("text", text)
-        reactContext
-            .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+        reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
             .emit(eventName, map)
     }
 }

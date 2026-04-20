@@ -2,7 +2,7 @@ import React, { useEffect, useState, useRef } from 'react';
 import {
   View, Text, TouchableOpacity, StyleSheet,
   NativeModules, NativeEventEmitter, PermissionsAndroid,
-  ScrollView, Animated, StatusBar, ActivityIndicator, Switch,
+  ScrollView, Animated, StatusBar, ActivityIndicator,
 } from 'react-native';
 
 const { Vosk } = NativeModules;
@@ -11,21 +11,15 @@ const voskEmitter = new NativeEventEmitter(Vosk);
 type AppState = 'idle' | 'recording' | 'processing' | 'diagnosing';
 
 export default function App() {
-  const [modelReady, setModelReady]     = useState(false);
-  const [appState, setAppState]         = useState<AppState>('idle');
-  const [partial, setPartial]           = useState('');
-  const [transcript, setTranscript]     = useState('');
-  const [diagnostic, setDiagnostic]     = useState('');
-  const [showDiag, setShowDiag]         = useState(false);
-  const [status, setStatus]             = useState('');
+  const [modelReady, setModelReady]   = useState(false);
+  const [appState, setAppState]       = useState<AppState>('idle');
+  const [transcript, setTranscript]   = useState('');
+  const [diagnostic, setDiagnostic]   = useState('');
+  const [showDiag, setShowDiag]       = useState(false);
+  const [status, setStatus]           = useState('');
 
-  // Config state — mirrors Config data class in Kotlin
-  const [silenceRms, setSilenceRms]     = useState(150);
-  const [globalGain, setGlobalGain]     = useState(1.5);
-  const [frameTargetRms, setFrameTargetRms] = useState(5000);
-  const [pitchSemitones, setPitch]      = useState(0);
-  const [comfortNoise, setComfortNoise] = useState(true);
-  const [perFrameNorm, setPerFrameNorm] = useState(true);
+  const [globalGain, setGlobalGain]   = useState(1.5);
+  const [numPasses, setNumPasses]     = useState(3);
 
   const scrollRef = useRef<ScrollView>(null);
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -53,9 +47,9 @@ export default function App() {
 
   useEffect(() => {
     const subs = [
-      voskEmitter.addListener('onPartialResult', e => setPartial(e.text || '')),
+      voskEmitter.addListener('onPartialResult', () => {}),
       voskEmitter.addListener('onFinalResult', e => {
-        if (e.text) { setTranscript(e.text); setPartial(''); }
+        if (e.text) setTranscript(e.text);
       }),
       voskEmitter.addListener('onStatus', e => setStatus(e.text || '')),
       voskEmitter.addListener('onDiagnostic', e => {
@@ -69,19 +63,14 @@ export default function App() {
 
   const applyConfig = async () => {
     await Vosk.setConfig({
-      silenceRms, globalGain, frameTargetRms,
-      pitchSemitones, comfortNoise, perFrameNorm,
-      frameMaxGain: 15,
-      comfortNoiseRms: 60,
-      silenceGapFrames: 20,
-      hpAlpha: 0.97,
+      globalGain,
+      numPasses,
     });
   };
 
-  // Auto-apply config whenever any value changes
-  useEffect(() => { if (modelReady) applyConfig(); }, [
-    silenceRms, globalGain, frameTargetRms, pitchSemitones, comfortNoise, perFrameNorm, modelReady
-  ]);
+  useEffect(() => {
+    if (modelReady) applyConfig();
+  }, [globalGain, numPasses, modelReady]);
 
   const handleMic = async () => {
     if (appState === 'idle') {
@@ -89,7 +78,6 @@ export default function App() {
       setAppState('recording');
     } else if (appState === 'recording') {
       setAppState('processing');
-      setPartial('');
       await Vosk.stopListening();
       setAppState('idle');
     }
@@ -100,21 +88,12 @@ export default function App() {
     setDiagnostic('');
     setShowDiag(false);
     await Vosk.diagnose();
-    // result comes back via onDiagnostic event
   };
 
   const handleClear = async () => {
     if (appState === 'recording') await Vosk.stopListening().catch(() => {});
     setAppState('idle');
-    setTranscript(''); setPartial('');
-  };
-
-  // Parse suggested values from diagnostic and apply them
-  const applySuggested = () => {
-    const rmsMatch  = diagnostic.match(/silenceRms\s*→\s*(\d+)/);
-    const gainMatch = diagnostic.match(/globalGain\s*→\s*([\d.]+)/);
-    if (rmsMatch)  setSilenceRms(parseInt(rmsMatch[1]));
-    if (gainMatch) setGlobalGain(parseFloat(gainMatch[1]));
+    setTranscript('');
   };
 
   const busy = appState !== 'idle';
@@ -122,8 +101,6 @@ export default function App() {
   return (
     <View style={s.root}>
       <StatusBar barStyle="light-content" backgroundColor="#090C14" />
-
-      {/* Header */}
       <View style={s.header}>
         <Text style={s.title}>VoiceScribe</Text>
         <View style={[s.pill, { backgroundColor: modelReady ? '#0c2e1a' : '#221e08' }]}>
@@ -134,36 +111,30 @@ export default function App() {
         </View>
       </View>
 
-      {/* Diagnostic panel */}
       {showDiag && (
         <View style={s.diagBox}>
           <Text style={s.diagTitle}>Diagnostic Report</Text>
           <ScrollView style={{ maxHeight: 180 }}>
             <Text style={s.diagText}>{diagnostic}</Text>
           </ScrollView>
-          <TouchableOpacity style={s.applyBtn} onPress={applySuggested}>
-            <Text style={s.applyBtnTxt}>Apply suggested values</Text>
+          <TouchableOpacity style={s.closeBtn} onPress={() => setShowDiag(false)}>
+            <Text style={s.closeBtnTxt}>Close</Text>
           </TouchableOpacity>
         </View>
       )}
 
-      {/* Transcript */}
       <ScrollView ref={scrollRef} style={s.box} contentContainerStyle={s.boxPad}>
-        {transcript.length === 0 && partial.length === 0 ? (
+        {transcript.length === 0 ? (
           <Text style={s.hint}>
             {appState === 'diagnosing'
               ? '🎙 Speak normally for 5 seconds…'
-              : 'Run Diagnose first, apply suggested values, then record.'}
+              : `Tap mic → speak → stop → ${numPasses} passes\nGain ${globalGain}x`}
           </Text>
         ) : (
-          <>
-            <Text style={s.txText}>{transcript}</Text>
-            {partial.length > 0 && <Text style={s.partialTxt}>{partial}</Text>}
-          </>
+          <Text style={s.txText}>{transcript}</Text>
         )}
       </ScrollView>
 
-      {/* Status */}
       {(appState === 'processing' || appState === 'diagnosing') && (
         <View style={s.statusRow}>
           <ActivityIndicator size="small" color="#6C8EFF" />
@@ -171,7 +142,6 @@ export default function App() {
         </View>
       )}
 
-      {/* Main controls */}
       <View style={s.controls}>
         <TouchableOpacity style={[s.sideBtn, busy && s.dim]} onPress={handleClear} disabled={busy}>
           <Text style={s.sideTxt}>Clear</Text>
@@ -182,7 +152,8 @@ export default function App() {
             <Animated.View style={[s.ripple, { transform: [{ scale: pulseAnim }] }]} />
           )}
           <TouchableOpacity
-            style={[s.micBtn,
+            style={[
+              s.micBtn,
               appState === 'recording'  && s.micStop,
               appState === 'processing' && s.micBusy,
               (!modelReady || (busy && appState !== 'recording')) && s.dim,
@@ -196,47 +167,22 @@ export default function App() {
           </TouchableOpacity>
         </View>
 
-        <TouchableOpacity
-          style={[s.sideBtn, (busy) && s.dim]}
-          onPress={handleDiagnose}
-          disabled={busy}
-        >
+        <TouchableOpacity style={[s.sideBtn, busy && s.dim]} onPress={handleDiagnose} disabled={busy}>
           <Text style={s.sideTxt}>Diagnose</Text>
         </TouchableOpacity>
       </View>
 
-      {/* Config panel */}
       <ScrollView style={s.cfgPanel} contentContainerStyle={s.cfgPad}>
         <Text style={s.cfgTitle}>Configuration</Text>
 
-        <Row label={`Silence RMS  ${silenceRms}`}>
-          <StepBtn onPress={() => setSilenceRms(v => Math.max(10, v - 10))}  label="−" />
-          <StepBtn onPress={() => setSilenceRms(v => Math.min(2000, v + 10))} label="+" />
+        <Row label={`Recognition passes  ${numPasses}`}>
+          <StepBtn onPress={() => setNumPasses(v => Math.max(1, v - 1))} label="−" />
+          <StepBtn onPress={() => setNumPasses(v => Math.min(10, v + 1))} label="+" />
         </Row>
 
         <Row label={`Global Gain  ×${globalGain.toFixed(1)}`}>
-          <StepBtn onPress={() => setGlobalGain(v => Math.max(1, parseFloat((v - 0.5).toFixed(1))))}  label="−" />
-          <StepBtn onPress={() => setGlobalGain(v => Math.min(15, parseFloat((v + 0.5).toFixed(1))))} label="+" />
-        </Row>
-
-        <Row label={`Frame Target RMS  ${frameTargetRms}`}>
-          <StepBtn onPress={() => setFrameTargetRms(v => Math.max(1000, v - 500))}  label="−" />
-          <StepBtn onPress={() => setFrameTargetRms(v => Math.min(16000, v + 500))} label="+" />
-        </Row>
-
-        <Row label={`Pitch Shift  +${pitchSemitones} st`}>
-          <StepBtn onPress={() => setPitch(v => Math.max(0, v - 1))}  label="−" />
-          <StepBtn onPress={() => setPitch(v => Math.min(6, v + 1))}  label="+" />
-        </Row>
-
-        <Row label="Per-frame normalize">
-          <Switch value={perFrameNorm} onValueChange={setPerFrameNorm}
-            trackColor={{ true: '#3B54F0' }} thumbColor="#fff" />
-        </Row>
-
-        <Row label="Comfort noise (pause bridge)">
-          <Switch value={comfortNoise} onValueChange={setComfortNoise}
-            trackColor={{ true: '#3B54F0' }} thumbColor="#fff" />
+          <StepBtn onPress={() => setGlobalGain(v => Math.max(0.5, v - 0.5))} label="−" />
+          <StepBtn onPress={() => setGlobalGain(v => Math.min(5, v + 0.5))} label="+" />
         </Row>
       </ScrollView>
     </View>
@@ -271,14 +217,13 @@ const s = StyleSheet.create({
   diagBox:    { marginHorizontal: 14, marginBottom: 8, backgroundColor: '#0f1a10', borderRadius: 12, borderWidth: 1, borderColor: '#1a3a1a', padding: 12 },
   diagTitle:  { color: '#4ade80', fontSize: 13, fontWeight: '700', marginBottom: 6 },
   diagText:   { color: '#8aaf8a', fontSize: 11, fontFamily: 'monospace', lineHeight: 18 },
-  applyBtn:   { marginTop: 8, backgroundColor: '#1a3a1a', borderRadius: 8, padding: 8, alignItems: 'center' },
-  applyBtnTxt:{ color: '#4ade80', fontSize: 12, fontWeight: '600' },
+  closeBtn:   { marginTop: 8, backgroundColor: '#1a3a1a', borderRadius: 8, padding: 8, alignItems: 'center' },
+  closeBtnTxt:{ color: '#4ade80', fontSize: 12, fontWeight: '600' },
 
   box:        { flex: 1, marginHorizontal: 14, backgroundColor: '#10131D', borderRadius: 16, borderWidth: 1, borderColor: '#1C2035' },
   boxPad:     { padding: 18, minHeight: 120 },
   hint:       { color: '#30364A', fontSize: 15, lineHeight: 24, textAlign: 'center', marginTop: 20 },
   txText:     { color: '#D4DBF5', fontSize: 18, lineHeight: 30 },
-  partialTxt: { color: '#4A5275', fontSize: 17, lineHeight: 28, fontStyle: 'italic', marginTop: 4 },
 
   statusRow:  { flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 8, marginTop: 6 },
   statusTxt:  { color: '#6C8EFF', fontSize: 12 },
@@ -294,7 +239,7 @@ const s = StyleSheet.create({
   sideTxt:    { color: '#5A6180', fontSize: 13, fontWeight: '500' },
   dim:        { opacity: 0.3 },
 
-  cfgPanel:   { maxHeight: 210, borderTopWidth: 1, borderTopColor: '#141726' },
+  cfgPanel:   { maxHeight: 150, borderTopWidth: 1, borderTopColor: '#141726' },
   cfgPad:     { padding: 14, paddingBottom: 24 },
   cfgTitle:   { color: '#3A4060', fontSize: 11, fontWeight: '700', letterSpacing: 1, textTransform: 'uppercase', marginBottom: 8 },
   row:        { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', paddingVertical: 6, borderBottomWidth: 1, borderBottomColor: '#12151E' },
