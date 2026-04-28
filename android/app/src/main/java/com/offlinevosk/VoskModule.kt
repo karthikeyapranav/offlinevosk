@@ -23,8 +23,9 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
     private val ENCODING    = AudioFormat.ENCODING_PCM_16BIT
 
     // Config from JS
-    private var cfgGlobalGain       = 1.5f
-    private var cfgNumPasses        = 3
+    // Raised default from 1.5 → 50.0 — Telugu model needs very strong signal
+    private var cfgGlobalGain   = 50.0f
+    private var cfgNumPasses    = 3
 
     override fun getName() = "Vosk"
     @ReactMethod fun addListener(eventName: String) {}
@@ -109,11 +110,16 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
                 var bestLength = 0
 
                 for (pass in 1..cfgNumPasses) {
-                    // Vary gain from 0.7x to 1.3x base gain
-                    val gainFactor = 0.7f + (pass - 1) * 0.3f
+                    // Pass 1: base gain, Pass 2: 1.5x, Pass 3: 2x
+                    // All passes still go through soft clip + normalize, so they
+                    // never actually distort — just explore different saturation curves.
+                    val gainFactor = 1.0f + (pass - 1) * 0.5f
                     val passGain = cfgGlobalGain * gainFactor
                     val transcript = processPcmFile(raw, passGain)
-                    sendEvent("onStatus", "Pass $pass (gain ${passGain}x): ${if (transcript.isEmpty()) "[no speech]" else transcript.take(60)}")
+                    sendEvent(
+                        "onStatus",
+                        "Pass $pass (gain ${passGain}x): ${if (transcript.isEmpty()) "[no speech]" else transcript.take(60)}"
+                    )
 
                     if (transcript.length > bestLength) {
                         bestLength = transcript.length
@@ -135,18 +141,48 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
     private fun processPcmFile(file: File, gain: Float): String {
         var samples = readPcmFile(file)
 
-        // Apply gain (simple multiplication, but prevent clipping)
-        val gainLimited = gain.coerceIn(0.5f, 5f)  // max 5x to avoid distortion
-        samples = applyGain(samples, gainLimited)
+        // Step 1 — Aggressive gain (no hard cap; soft clip handles limiting)
+        samples = applyGainSoftClip(samples, gain)
 
-        // Run Vosk
+        // Step 2 — Normalize to 90% full scale so Vosk always gets strong signal
+        samples = normalize(samples, targetPeak = 0.90f)
+
         return runVosk(samples)
     }
 
-    private fun applyGain(input: ShortArray, gain: Float): ShortArray {
+    /**
+     * Apply gain with tanh soft clipping instead of a hard coerceIn.
+     *
+     * Why tanh?  Hard clipping (coerceIn) chops the waveform flat at ±32767,
+     * turning smooth speech peaks into square waves full of harsh harmonics that
+     * confuse the acoustic model.  tanh compresses peaks smoothly — the louder the
+     * input the more it saturates, but the waveform shape stays speech-like.
+     *
+     * Formula:  out = tanh(in * gain / 32768) * 32767
+     * The /32768 maps to the ±1 domain where tanh lives; *32767 maps back.
+     */
+    private fun applyGainSoftClip(input: ShortArray, gain: Float): ShortArray {
         return ShortArray(input.size) { i ->
-            val v = (input[i] * gain).toInt().coerceIn(-32768, 32767)
-            v.toShort()
+            val normalized = input[i].toDouble() / 32768.0   // → [-1, 1]
+            val amplified  = normalized * gain.toDouble()
+            val softClipped = tanh(amplified)                 // smooth saturation
+            (softClipped * 32767.0).toInt().toShort()
+        }
+    }
+
+    /**
+     * Scale the entire buffer so its peak sample equals [targetPeak] * 32767.
+     * This guarantees Vosk receives a loud, full-range signal even when the
+     * microphone captured a whisper.
+     *
+     * If the buffer is all silence (peak == 0) we skip scaling to avoid NaN.
+     */
+    private fun normalize(input: ShortArray, targetPeak: Float): ShortArray {
+        val peak = input.maxOfOrNull { abs(it.toInt()) } ?: 0
+        if (peak == 0) return input
+        val scale = (targetPeak * 32767.0f) / peak.toFloat()
+        return ShortArray(input.size) { i ->
+            (input[i].toInt() * scale).toInt().coerceIn(-32767, 32767).toShort()
         }
     }
 
@@ -229,15 +265,24 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
                 val p90 = sorted[(sorted.size * 0.90).toInt()]
                 val avg = sorted.average().toFloat()
 
+                // Ideal Vosk target RMS is ~8000. Suggest gain to reach that.
+                val suggestedGain = (8000f / p90.coerceAtLeast(1f)).coerceIn(1f, 200f)
+
                 val report = buildString {
                     appendLine("═══ DIAGNOSTIC REPORT ═══")
-                    appendLine("RAW audio RMS:")
-                    appendLine("  P10 : ${p10.toInt()}")
-                    appendLine("  P50 : ${p50.toInt()}")
-                    appendLine("  P90 : ${p90.toInt()}")
+                    appendLine("RAW audio RMS (before any processing):")
+                    appendLine("  P10 : ${p10.toInt()}  (quiet frames / silence)")
+                    appendLine("  P50 : ${p50.toInt()}  (median speech)")
+                    appendLine("  P90 : ${p90.toInt()}  (loud speech peaks)")
                     appendLine("  Avg : ${avg.toInt()}")
                     appendLine()
-                    appendLine("Suggested gain: ${(8000f / p90).coerceIn(1f, 10f)}")
+                    appendLine("Target P90 for Vosk: ~8000")
+                    appendLine("Suggested cfgGlobalGain: ${"%.1f".format(suggestedGain)}")
+                    appendLine()
+                    appendLine("Note: With soft-clip + normalize the gain")
+                    appendLine("is a starting compression curve, not a")
+                    appendLine("hard amplification. Higher = more saturation")
+                    appendLine("of peaks, which often helps weak mic signals.")
                 }
                 sendEvent("onDiagnostic", report)
                 promise.resolve(report)
