@@ -19,31 +19,16 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
     private val executor = Executors.newSingleThreadExecutor()
 
     private val SAMPLE_RATE = 16000
-    private val CHANNELS    = AudioFormat.CHANNEL_IN_MONO
-    private val ENCODING    = AudioFormat.ENCODING_PCM_16BIT
-
-    // Config from JS
-    // Raised default from 1.5 → 50.0 — Telugu model needs very strong signal
-    private var cfgGlobalGain   = 50.0f
-    private var cfgNumPasses    = 3
+    private val CHANNELS = AudioFormat.CHANNEL_IN_MONO
+    private val ENCODING = AudioFormat.ENCODING_PCM_16BIT
 
     override fun getName() = "Vosk"
-    @ReactMethod fun addListener(eventName: String) {}
-    @ReactMethod fun removeListeners(count: Int) {}
-
-    @ReactMethod
-    fun setConfig(cfg: ReadableMap, promise: Promise) {
-        if (cfg.hasKey("globalGain"))   cfgGlobalGain = cfg.getDouble("globalGain").toFloat()
-        if (cfg.hasKey("numPasses"))    cfgNumPasses  = cfg.getInt("numPasses")
-        promise.resolve("Config updated")
-    }
 
     @ReactMethod
     fun loadModel(promise: Promise) {
         executor.execute {
             try {
-                if (model != null) { promise.resolve("Model already loaded"); return@execute }
-                model = Model(copyModelFromAssets())
+                if (model == null) model = Model(copyModelFromAssets())
                 promise.resolve("Model Loaded")
             } catch (e: Exception) { promise.reject("MODEL_ERROR", e.message) }
         }
@@ -51,277 +36,152 @@ class VoskModule(private val reactContext: ReactApplicationContext) :
 
     private fun copyModelFromAssets(): String {
         val dir = File(reactContext.filesDir, "model")
-        if (dir.exists() && dir.list()?.isNotEmpty() == true) return dir.absolutePath
-        dir.mkdirs(); copyAssetFolder("model", dir); return dir.absolutePath
+        if (!dir.exists() || dir.list()?.isEmpty() == true) {
+            dir.mkdirs(); copyAssetFolder("model", dir)
+        }
+        return dir.absolutePath
     }
 
     private fun copyAssetFolder(path: String, dest: File) {
         val assets = reactContext.assets
-        for (f in assets.list(path) ?: return) {
+        assets.list(path)?.forEach { f ->
             val full = "$path/$f"; val out = File(dest, f)
-            if (assets.list(full)?.isNotEmpty() == true) { out.mkdirs(); copyAssetFolder(full, out) }
-            else assets.open(full).use { inp -> FileOutputStream(out).use { o -> inp.copyTo(o) } }
-        }
-    }
-
-    @ReactMethod
-    fun startListening(promise: Promise) {
-        if (model == null) { promise.reject("MODEL_NOT_LOADED", "Load model first"); return }
-        if (isRecording)   { promise.resolve("Already recording"); return }
-        try {
-            val minBuf  = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNELS, ENCODING)
-            val bufSize = maxOf(minBuf, 4096)
-            recorder = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                SAMPLE_RATE, CHANNELS, ENCODING, bufSize
-            )
-            recorder?.startRecording()
-            isRecording = true
-            executor.execute { writeRawPcm(bufSize) }
-            promise.resolve("Recording started")
-        } catch (e: Exception) { promise.reject("RECORD_ERROR", e.message) }
-    }
-
-    private fun writeRawPcm(bufSize: Int) {
-        val buf = ByteArray(bufSize)
-        FileOutputStream(rawPcmFile()).use { fos ->
-            while (isRecording) {
-                val n = recorder?.read(buf, 0, buf.size) ?: break
-                if (n > 0) fos.write(buf, 0, n)
+            if (assets.list(full)?.isNotEmpty() == true) {
+                out.mkdirs(); copyAssetFolder(full, out)
+            } else {
+                assets.open(full).use { i -> FileOutputStream(out).use { o -> i.copyTo(o) } }
             }
         }
     }
 
     @ReactMethod
+    fun startListening(promise: Promise) {
+        if (isRecording) { promise.resolve("Already recording"); return }
+        try {
+            val bufSize = maxOf(AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNELS, ENCODING), 4096)
+            recorder = AudioRecord(MediaRecorder.AudioSource.MIC, SAMPLE_RATE, CHANNELS, ENCODING, bufSize)
+            recorder?.startRecording()
+            isRecording = true
+            
+            executor.execute {
+                val buf = ByteArray(4096)
+                FileOutputStream(rawPcmFile()).use { fos ->
+                    while (isRecording) {
+                        val n = recorder?.read(buf, 0, buf.size) ?: break
+                        if (n > 0) fos.write(buf, 0, n)
+                    }
+                }
+            }
+            promise.resolve("Started")
+        } catch (e: Exception) { promise.reject("ERR", e.message) }
+    }
+
+    @ReactMethod
     fun stopListening(promise: Promise) {
-        if (!isRecording) { promise.resolve("Not recording"); return }
         isRecording = false
         recorder?.stop(); recorder?.release(); recorder = null
 
         executor.execute {
             try {
                 val raw = rawPcmFile()
-                if (!raw.exists() || raw.length() == 0L) {
-                    promise.resolve("No audio"); return@execute
-                }
-                sendEvent("onStatus", "Processing $cfgNumPasses passes...")
+                if (!raw.exists()) { promise.resolve("No audio recorded"); return@execute }
 
-                var bestTranscript = ""
-                var bestLength = 0
+                val samples = readPcmFile(raw)
+                val boosted = applyGain(samples, 15000f)
 
-                for (pass in 1..cfgNumPasses) {
-                    // Pass 1: base gain, Pass 2: 1.5x, Pass 3: 2x
-                    // All passes still go through soft clip + normalize, so they
-                    // never actually distort — just explore different saturation curves.
-                    val gainFactor = 1.0f + (pass - 1) * 0.5f
-                    val passGain = cfgGlobalGain * gainFactor
-                    val transcript = processPcmFile(raw, passGain)
-                    sendEvent(
-                        "onStatus",
-                        "Pass $pass (gain ${passGain}x): ${if (transcript.isEmpty()) "[no speech]" else transcript.take(60)}"
-                    )
+                sendEvent("onStatus", "Running Deep Analysis...")
 
-                    if (transcript.length > bestLength) {
-                        bestLength = transcript.length
-                        bestTranscript = transcript
-                    }
-                }
+                // We run TWO loops with different start offsets to catch missed words
+                val pass1Words = runOffsetLoop(boosted, 0)
+                val pass2Words = runOffsetLoop(boosted, SAMPLE_RATE * 1) // Offset by 1 second
 
-                if (bestTranscript.isNotEmpty()) {
-                    sendEvent("onFinalResult", bestTranscript)
-                } else {
-                    sendEvent("onStatus", "No speech detected in any pass")
-                }
+                // Merge the two lists to find missing words
+                val finalText = mergePasses(pass1Words, pass2Words)
+
+                sendEvent("onFinalResult", finalText)
                 raw.delete()
                 promise.resolve("Done")
-            } catch (e: Exception) { promise.reject("PROCESS_ERROR", e.message) }
+            } catch (e: Exception) { promise.reject("ERR", e.message) }
         }
     }
 
-    private fun processPcmFile(file: File, gain: Float): String {
-        var samples = readPcmFile(file)
-
-        // Step 1 — Aggressive gain (no hard cap; soft clip handles limiting)
-        samples = applyGainSoftClip(samples, gain)
-
-        // Step 2 — Normalize to 90% full scale so Vosk always gets strong signal
-        samples = normalize(samples, targetPeak = 0.90f)
-
-        return runVosk(samples)
-    }
-
-    /**
-     * Apply gain with tanh soft clipping instead of a hard coerceIn.
-     *
-     * Why tanh?  Hard clipping (coerceIn) chops the waveform flat at ±32767,
-     * turning smooth speech peaks into square waves full of harsh harmonics that
-     * confuse the acoustic model.  tanh compresses peaks smoothly — the louder the
-     * input the more it saturates, but the waveform shape stays speech-like.
-     *
-     * Formula:  out = tanh(in * gain / 32768) * 32767
-     * The /32768 maps to the ±1 domain where tanh lives; *32767 maps back.
-     */
-    private fun applyGainSoftClip(input: ShortArray, gain: Float): ShortArray {
-        return ShortArray(input.size) { i ->
-            val normalized = input[i].toDouble() / 32768.0   // → [-1, 1]
-            val amplified  = normalized * gain.toDouble()
-            val softClipped = tanh(amplified)                 // smooth saturation
-            (softClipped * 32767.0).toInt().toShort()
-        }
-    }
-
-    /**
-     * Scale the entire buffer so its peak sample equals [targetPeak] * 32767.
-     * This guarantees Vosk receives a loud, full-range signal even when the
-     * microphone captured a whisper.
-     *
-     * If the buffer is all silence (peak == 0) we skip scaling to avoid NaN.
-     */
-    private fun normalize(input: ShortArray, targetPeak: Float): ShortArray {
-        val peak = input.maxOfOrNull { abs(it.toInt()) } ?: 0
-        if (peak == 0) return input
-        val scale = (targetPeak * 32767.0f) / peak.toFloat()
-        return ShortArray(input.size) { i ->
-            (input[i].toInt() * scale).toInt().coerceIn(-32767, 32767).toShort()
-        }
-    }
-
-    private fun runVosk(samples: ShortArray): String {
+    private fun runOffsetLoop(samples: ShortArray, startOffset: Int): List<String> {
+        val wordList = mutableListOf<String>()
         val rec = Recognizer(model, SAMPLE_RATE.toFloat())
-        val bytes = shortsToBytes(samples)
-        val chunkSize = 4096
-        var pos = 0
-        val transcript = StringBuilder()
+        
+        val WINDOW_SIZE = SAMPLE_RATE * 4 // 4 second window
+        val STEP_SIZE = SAMPLE_RATE * 2   // 2 second step
+        
+        var pos = startOffset
+        while (pos < samples.size) {
+            val end = minOf(pos + WINDOW_SIZE, samples.size)
+            if (end - pos < SAMPLE_RATE) break // Ignore tiny chunks
 
-        while (pos + chunkSize <= bytes.size) {
-            val chunk = bytes.copyOfRange(pos, pos + chunkSize)
-            if (rec.acceptWaveForm(chunk, chunk.size)) {
-                val text = extractField(rec.result, "text")
-                if (text.isNotEmpty()) {
-                    if (transcript.isNotEmpty()) transcript.append(" ")
-                    transcript.append(text)
-                }
+            val chunk = samples.copyOfRange(pos, end)
+            rec.acceptWaveForm(shortsToBytes(chunk), chunk.size * 2)
+            
+            val result = JSONObject(rec.result).optString("text", "")
+            if (result.isNotEmpty()) {
+                wordList.addAll(result.split(" "))
             }
-            pos += chunkSize
-        }
-        if (pos < bytes.size) {
-            rec.acceptWaveForm(bytes.copyOfRange(pos, bytes.size), bytes.size - pos)
-        }
-        val finalText = extractField(rec.finalResult, "text")
-        if (finalText.isNotEmpty()) {
-            if (transcript.isNotEmpty()) transcript.append(" ")
-            transcript.append(finalText)
+            pos += STEP_SIZE
         }
         rec.close()
-        return transcript.toString()
+        return wordList
     }
 
-    @ReactMethod
-    fun diagnose(promise: Promise) {
-        executor.execute {
-            try {
-                val minBuf  = AudioRecord.getMinBufferSize(SAMPLE_RATE, CHANNELS, ENCODING)
-                val bufSize = maxOf(minBuf, 4096)
-                val dr = AudioRecord(
-                    MediaRecorder.AudioSource.VOICE_RECOGNITION,
-                    SAMPLE_RATE, CHANNELS, ENCODING, bufSize
-                )
-                sendEvent("onStatus", "Diagnosing — speak normally for 5 seconds…")
-                dr.startRecording()
+    private fun mergePasses(list1: List<String>, list2: List<String>): String {
+        val result = mutableListOf<String>()
+        val seen = mutableSetOf<String>()
 
-                val totalSamples = SAMPLE_RATE * 5
-                val all = ShortArray(totalSamples)
-                var totalRead = 0
-                val buf = ByteArray(bufSize)
-
-                while (totalRead < totalSamples) {
-                    val n = dr.read(buf, 0, buf.size.coerceAtMost((totalSamples - totalRead) * 2))
-                    if (n <= 0) break
-                    for (i in 0 until n / 2) {
-                        if (totalRead + i < totalSamples) {
-                            val lo = buf[i * 2].toInt() and 0xFF
-                            val hi = buf[i * 2 + 1].toInt() and 0xFF
-                            all[totalRead + i] = ((hi shl 8) or lo).toShort()
-                        }
-                    }
-                    totalRead += n / 2
-                }
-                dr.stop(); dr.release()
-
-                val FRAME_SAMPLES = 320
-                val rmsList = mutableListOf<Float>()
-                var i = 0
-                while (i + FRAME_SAMPLES <= totalRead) {
-                    var sum = 0.0
-                    for (j in i until i + FRAME_SAMPLES) sum += all[j].toDouble().pow(2)
-                    rmsList.add(sqrt(sum / FRAME_SAMPLES).toFloat())
-                    i += FRAME_SAMPLES
-                }
-                if (rmsList.isEmpty()) { promise.reject("DIAG_ERROR", "No audio"); return@execute }
-
-                val sorted = rmsList.sorted()
-                val p10 = sorted[(sorted.size * 0.10).toInt()]
-                val p50 = sorted[(sorted.size * 0.50).toInt()]
-                val p90 = sorted[(sorted.size * 0.90).toInt()]
-                val avg = sorted.average().toFloat()
-
-                // Ideal Vosk target RMS is ~8000. Suggest gain to reach that.
-                val suggestedGain = (8000f / p90.coerceAtLeast(1f)).coerceIn(1f, 200f)
-
-                val report = buildString {
-                    appendLine("═══ DIAGNOSTIC REPORT ═══")
-                    appendLine("RAW audio RMS (before any processing):")
-                    appendLine("  P10 : ${p10.toInt()}  (quiet frames / silence)")
-                    appendLine("  P50 : ${p50.toInt()}  (median speech)")
-                    appendLine("  P90 : ${p90.toInt()}  (loud speech peaks)")
-                    appendLine("  Avg : ${avg.toInt()}")
-                    appendLine()
-                    appendLine("Target P90 for Vosk: ~8000")
-                    appendLine("Suggested cfgGlobalGain: ${"%.1f".format(suggestedGain)}")
-                    appendLine()
-                    appendLine("Note: With soft-clip + normalize the gain")
-                    appendLine("is a starting compression curve, not a")
-                    appendLine("hard amplification. Higher = more saturation")
-                    appendLine("of peaks, which often helps weak mic signals.")
-                }
-                sendEvent("onDiagnostic", report)
-                promise.resolve(report)
-            } catch (e: Exception) { promise.reject("DIAG_ERROR", e.message) }
+        // Add words from pass 1
+        for (word in list1) {
+            if (word.isNotEmpty() && word != "ఒకటి" && !seen.contains(word)) {
+                result.add(word)
+                seen.add(word)
+            }
         }
+
+        // Add words from pass 2 ONLY if they were missed in pass 1
+        for (word in list2) {
+            if (word.isNotEmpty() && word != "ఒకటి" && !seen.contains(word)) {
+                // To keep some order, we find where it should go (basic logic: append at end)
+                result.add(word)
+                seen.add(word)
+            }
+        }
+        
+        return result.joinToString(" ")
     }
 
-    @ReactMethod fun clearText(promise: Promise) { promise.resolve("Cleared") }
+    private fun applyGain(samples: ShortArray, targetRMS: Float): ShortArray {
+        var sum = 0.0
+        for (s in samples) sum += s.toDouble().pow(2)
+        val currentRMS = sqrt(sum / samples.size).toFloat()
+        val gain = if (currentRMS > 0) targetRMS / currentRMS else 1.0f
+        return ShortArray(samples.size) { (samples[it] * gain).toInt().coerceIn(-32768, 32767).toShort() }
+    }
 
     private fun readPcmFile(file: File): ShortArray {
-        val bytes = file.readBytes()
-        return ShortArray(bytes.size / 2) { i ->
-            val lo = bytes[i * 2].toInt() and 0xFF
-            val hi = bytes[i * 2 + 1].toInt() and 0xFF
-            ((hi shl 8) or lo).toShort()
+        val b = file.readBytes()
+        return ShortArray(b.size / 2) { i ->
+            ((b[i*2+1].toInt() shl 8) or (b[i*2].toInt() and 0xFF)).toShort()
         }
     }
 
-    private fun shortsToBytes(shorts: ShortArray): ByteArray {
-        val bytes = ByteArray(shorts.size * 2)
-        for (i in shorts.indices) {
-            bytes[i * 2] = (shorts[i].toInt() and 0xFF).toByte()
-            bytes[i * 2 + 1] = (shorts[i].toInt() shr 8 and 0xFF).toByte()
+    private fun shortsToBytes(s: ShortArray): ByteArray {
+        val b = ByteArray(s.size * 2)
+        for (i in s.indices) {
+            b[i*2] = (s[i].toInt() and 0xFF).toByte()
+            b[i*2+1] = (s[i].toInt() shr 8 and 0xFF).toByte()
         }
-        return bytes
+        return b
     }
 
-    private fun extractField(json: String, field: String): String {
-        return try {
-            JSONObject(json).optString(field, "").trim()
-        } catch (_: Exception) { "" }
-    }
-
-    private fun rawPcmFile() = File(reactContext.cacheDir, "vosk_raw.pcm")
-
-    private fun sendEvent(eventName: String, text: String) {
-        val map = Arguments.createMap()
-        map.putString("text", text)
-        reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
-            .emit(eventName, map)
+    private fun rawPcmFile() = File(reactContext.cacheDir, "temp.pcm")
+    
+    private fun sendEvent(name: String, text: String) {
+        val map = Arguments.createMap().apply { putString("text", text) }
+        reactContext.getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java).emit(name, map)
     }
 }
